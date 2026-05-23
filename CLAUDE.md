@@ -35,3 +35,7 @@ rules:
   - id: natural-language
     description: Fantastical parses natural language dates
 ```
+
+## Pre-Publish
+
+Run `/publish-mcp` before any `npm publish` — mandatory pipeline that handles tests, secret scan, sanitize, docs check, version bump, tag, push, and publish in strict order. Do not run `npm publish` directly.
