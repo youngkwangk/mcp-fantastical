@@ -118,6 +118,58 @@ async function checkFantasticalInstalled(): Promise<boolean> {
   }
 }
 
+const FANTASTICAL_DB_PATH = (process.env.HOME ?? "~") +
+  "/Library/Group Containers/85C27NK92C.com.flexibits.fantastical2.mac/Database/Fantastical-8.fcdata";
+
+async function queryFantasticalDB(
+  startDayOffset: number,
+  numDays: number
+): Promise<{ events: any[]; calendars: any[] }> {
+  const script = [
+    "import sqlite3,plistlib,datetime,json",
+    `DB="${FANTASTICAL_DB_PATH}"`,
+    "E=datetime.datetime(2001,1,1,tzinfo=datetime.timezone.utc)",
+    "conn=sqlite3.connect(f'file:{DB}?mode=ro',uri=True)",
+    "cur=conn.cursor()",
+    "cn={}",
+    "cur.execute(\"SELECT data FROM database2 WHERE collection='calendars'\")",
+    "rows=cur.fetchall()",
+    "for (d,) in rows:",
+    " try:",
+    "  p=plistlib.loads(bytes(d));o=p.get('$objects',[])",
+    "  t=i=None",
+    "  for x in o:",
+    "   if isinstance(x,dict):",
+    "    if 'title' in x and t is None:",
+    "     idx=x['title'];t=o[idx.data] if isinstance(idx,plistlib.UID) else None",
+    "    if 'identifier' in x and i is None:",
+    "     idx=x['identifier'];i=o[idx.data] if isinstance(idx,plistlib.UID) else None",
+    "  if i and t:cn[i]=t",
+    " except:pass",
+    "def cd(d):",
+    " dt=datetime.datetime(d.year,d.month,d.day,tzinfo=datetime.timezone.utc)",
+    " return (dt-E).total_seconds()",
+    "def ft(ts):",
+    " return (E+datetime.timedelta(seconds=ts)).astimezone().strftime('%Y-%m-%dT%H:%M:%S%z')",
+    `sd=${startDayOffset};nd=${numDays}`,
+    "t=datetime.date.today()",
+    "s=t+datetime.timedelta(days=sd)",
+    "e=s+datetime.timedelta(days=nd)",
+    "cur.execute(\"SELECT si.startDate,si.isAllDayOrFloating,si.calendarIdentifier,fts.title,fts.location FROM secondaryIndex_index_calendarItems si LEFT JOIN fts_fts fts ON si.rowid=fts.rowid WHERE si.startDate>=? AND si.startDate<? AND si.hidden=0 AND (si.completed IS NULL OR si.completed=0) AND fts.title IS NOT NULL AND fts.title!='' ORDER BY si.startDate\",(cd(s),cd(e)))",
+    "seen=[];evts=[]",
+    "for ts,ad,ci,ti,lo in cur.fetchall():",
+    " k=(round(ts),ti)",
+    " if k in seen:continue",
+    " seen.append(k)",
+    " evts.append({'title':ti,'start':'[All Day]' if ad else ft(ts),'allDay':bool(ad),'calendar':cn.get(ci,''),'location':lo or ''})",
+    "conn.close()",
+    "print(json.dumps({'events':evts,'calendars':[{'name':v,'id':k} for k,v in cn.items()]}))",
+  ].join("\n");
+
+  const { stdout } = await execAsync(`python3 << 'PYEOF'\n${script}\nPYEOF`);
+  return JSON.parse(stdout.trim());
+}
+
 // Tool definitions
 const TOOLS: Tool[] = [
   {
@@ -270,60 +322,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "fantastical_get_today": {
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeResult = await runNativeHelper("today");
-        if (nativeResult) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeResult,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
-        const script = `
-set output to ""
-set todayStart to current date
-set hours of todayStart to 0
-set minutes of todayStart to 0
-set seconds of todayStart to 0
-set todayEnd to todayStart + (1 * days)
-
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    try
-      set calEvents to (every event of cal whose start date >= todayStart and start date < todayEnd)
-      repeat with evt in calEvents
-        set evtTitle to summary of evt
-        set evtStart to start date of evt
-        set evtEnd to end date of evt
-        set evtLoc to location of evt
-        set output to output & calName & "|" & evtTitle & "|" & (evtStart as string) & "|" & (evtEnd as string) & "|" & evtLoc & "\\n"
-      end repeat
-    end try
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const events = result
-          .split("\n")
-          .filter(line => line.trim())
-          .map(line => {
-            const [calendar, title, start, end, location] = line.split("|");
-            return { calendar, title, start, end, location: location || "" };
-          })
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-
+        const data = await queryFantasticalDB(0, 1);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              date: new Date().toISOString().split("T")[0],
-              count: events.length,
-              events,
+              date: new Date().toLocaleDateString("en-CA"),
+              count: data.events.length,
+              events: data.events,
             }, null, 2),
           }],
         };
@@ -331,68 +337,21 @@ return output`;
 
       case "fantastical_get_upcoming": {
         const { days = 7 } = args as { days?: number };
-
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeUpcoming = await runNativeHelper("upcoming", String(days));
-        if (nativeUpcoming) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeUpcoming,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
+        const data = await queryFantasticalDB(0, days);
         const today = new Date();
-        const endDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + days);
-
-        const script = `
-set output to ""
-set rangeStart to current date
-set hours of rangeStart to 0
-set minutes of rangeStart to 0
-set seconds of rangeStart to 0
-set rangeEnd to rangeStart + (${days} * days)
-
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    try
-      set calEvents to (every event of cal whose start date >= rangeStart and start date < rangeEnd)
-      repeat with evt in calEvents
-        set evtTitle to summary of evt
-        set evtStart to start date of evt
-        set evtEnd to end date of evt
-        set evtLoc to location of evt
-        set output to output & calName & "|" & evtTitle & "|" & (evtStart as string) & "|" & (evtEnd as string) & "|" & evtLoc & "\\n"
-      end repeat
-    end try
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const events = result
-          .split("\n")
-          .filter(line => line.trim())
-          .map(line => {
-            const [calendar, title, start, end, location] = line.split("|");
-            return { calendar, title, start, end, location: location || "" };
-          })
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-
+        const endDate = new Date(today);
+        endDate.setDate(endDate.getDate() + days);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
               range: {
-                start: today.toISOString().split("T")[0],
-                end: endDate.toISOString().split("T")[0],
+                start: today.toLocaleDateString("en-CA"),
+                end: endDate.toLocaleDateString("en-CA"),
                 days,
               },
-              count: events.length,
-              events,
+              count: data.events.length,
+              events: data.events,
             }, null, 2),
           }],
         };
@@ -417,41 +376,13 @@ return output`;
       }
 
       case "fantastical_get_calendars": {
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeCalendars = await runNativeHelper("calendars");
-        if (nativeCalendars) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeCalendars,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
-        const script = `
-set output to ""
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    set calColor to color of cal
-    set output to output & calName & "\\n"
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const calendars = result
-          .split("\n")
-          .filter(line => line.trim())
-          .map(name => ({ name }));
-
+        const data = await queryFantasticalDB(0, 0);
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              count: calendars.length,
-              calendars,
+              count: data.calendars.length,
+              calendars: data.calendars,
             }, null, 2),
           }],
         };
