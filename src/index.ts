@@ -258,7 +258,127 @@ const TOOLS: Tool[] = [
       required: ["query"],
     },
   },
+  {
+    name: "fantastical_update_event",
+    description: "Update an existing Google Calendar event (title, location, description/notes, start time, end time). First use fantastical_get_today or fantastical_get_upcoming to find the event and get its calendar and title.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        calendarId: {
+          type: "string",
+          description: "Calendar identifier (e.g. 'youngkwangk@gmail.com' or a group calendar ID). Use 'primary' for the main calendar.",
+        },
+        eventTitle: {
+          type: "string",
+          description: "Current title of the event to find and update",
+        },
+        date: {
+          type: "string",
+          description: "Date of the event in YYYY-MM-DD format, used to narrow the search",
+        },
+        updates: {
+          type: "object",
+          description: "Fields to update",
+          properties: {
+            title: { type: "string", description: "New event title" },
+            location: { type: "string", description: "New event location" },
+            description: { type: "string", description: "New event description/notes" },
+          },
+        },
+      },
+      required: ["calendarId", "eventTitle", "date", "updates"],
+    },
+  },
 ];
+
+const GOOGLE_TOKEN_FILE = (process.env.HOME ?? "~") +
+  "/.config/opencode/google-calendar-token.json";
+const GOOGLE_CREDS_FILE = (process.env.HOME ?? "~") +
+  "/.config/opencode/google-calendar-credentials.json";
+
+async function getGoogleCalendarToken(): Promise<string> {
+  // Use python3 to get a valid (possibly refreshed) access token
+  const script = `
+import json, sys
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+
+try:
+    creds = Credentials.from_authorized_user_file(
+        "${GOOGLE_TOKEN_FILE}",
+        ["https://www.googleapis.com/auth/calendar"]
+    )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open("${GOOGLE_TOKEN_FILE}", "w") as f:
+            f.write(creds.to_json())
+    print(creds.token)
+except Exception as e:
+    print("ERROR:" + str(e), file=sys.stderr)
+    sys.exit(1)
+`;
+  const { stdout } = await execAsync(`python3 -c ${JSON.stringify(script)}`);
+  return stdout.trim();
+}
+
+async function updateGoogleCalendarEvent(
+  calendarId: string,
+  eventTitle: string,
+  date: string,
+  updates: { title?: string; location?: string; description?: string }
+): Promise<{ success: boolean; message: string; event?: any }> {
+  const token = await getGoogleCalendarToken();
+
+  // Search for the event on the given date
+  const timeMin = new Date(`${date}T00:00:00`).toISOString();
+  const timeMax = new Date(`${date}T23:59:59`).toISOString();
+  const listUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&singleEvents=true`;
+
+  const listRes = await execAsync(
+    `curl -s -H "Authorization: Bearer ${token}" "${listUrl}"`
+  );
+  const listData = JSON.parse(listRes.stdout);
+
+  if (listData.error) {
+    throw new Error(`Calendar API error: ${listData.error.message}`);
+  }
+
+  // Find matching event by title (case-insensitive)
+  const event = (listData.items ?? []).find((e: any) =>
+    (e.summary ?? "").toLowerCase().includes(eventTitle.toLowerCase())
+  );
+
+  if (!event) {
+    throw new Error(`Event "${eventTitle}" not found on ${date} in calendar ${calendarId}`);
+  }
+
+  // Build patch body
+  const patch: any = {};
+  if (updates.title) patch.summary = updates.title;
+  if (updates.location !== undefined) patch.location = updates.location;
+  if (updates.description !== undefined) patch.description = updates.description;
+
+  const patchUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${event.id}`;
+  const patchRes = await execAsync(
+    `curl -s -X PATCH -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" -d ${JSON.stringify(JSON.stringify(patch))} "${patchUrl}"`
+  );
+  const updated = JSON.parse(patchRes.stdout);
+
+  if (updated.error) {
+    throw new Error(`Update failed: ${updated.error.message}`);
+  }
+
+  return {
+    success: true,
+    message: `Updated "${updated.summary}" on ${date}`,
+    event: {
+      id: updated.id,
+      title: updated.summary,
+      location: updated.location ?? "",
+      description: updated.description ?? "",
+    },
+  };
+}
 
 // Create server instance
 const server = new Server(
@@ -402,6 +522,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               success: true,
               message: `Opened Fantastical search for: "${query}"`,
             }, null, 2),
+          }],
+        };
+      }
+
+      case "fantastical_update_event": {
+        const { calendarId, eventTitle, date, updates } = args as {
+          calendarId: string;
+          eventTitle: string;
+          date: string;
+          updates: { title?: string; location?: string; description?: string };
+        };
+
+        const result = await updateGoogleCalendarEvent(calendarId, eventTitle, date, updates);
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2),
           }],
         };
       }
