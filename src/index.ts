@@ -317,7 +317,7 @@ except Exception as e:
     print("ERROR:" + str(e), file=sys.stderr)
     sys.exit(1)
 `;
-  const { stdout } = await execAsync(`python3 -c ${JSON.stringify(script)}`);
+  const { stdout } = await execAsync(`python3 << 'PYEOF'\n${script}\nPYEOF`);
   return stdout.trim();
 }
 
