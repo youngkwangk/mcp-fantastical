@@ -240,20 +240,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           addImmediately?: boolean;
         };
 
-        // Build URL with parameters
-        const params = new URLSearchParams();
-        params.append("s", sentence);
-        if (addImmediately) {
-          params.append("add", "1");
-        }
-        if (calendar) {
-          params.append("calendarName", calendar);
-        }
-        if (notes) {
-          params.append("n", notes);
-        }
+        // Build URL with parameters using encodeURIComponent instead of
+        // URLSearchParams, which encodes spaces as "+" — Fantastical's URL
+        // scheme parser does not treat "+" as a space, causing natural language
+        // sentences with spaces to be misinterpreted (e.g. timed events
+        // created as all-day events).
+        const parts: string[] = [];
+        parts.push("s=" + encodeURIComponent(sentence));
+        if (addImmediately) parts.push("add=1");
+        if (calendar) parts.push("calendarName=" + encodeURIComponent(calendar));
+        if (notes) parts.push("n=" + encodeURIComponent(notes));
 
-        const url = `x-fantastical3://parse?${params.toString()}`;
+        const url = `x-fantastical3://parse?${parts.join("&")}`;
         const script = `do shell script "open '${url}'"`;
 
         await runAppleScript(script);
